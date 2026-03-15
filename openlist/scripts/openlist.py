@@ -30,11 +30,18 @@ ALLOWED_DELETE_POLICIES = {
     "delete_always",
     "upload_download_stream",
 }
-ALLOWED_PLAN_TYPES = {"fs_move", "fs_rename", "offline_create"}
+ALLOWED_PLAN_TYPES = {"fs_move", "fs_rename", "fs_remove", "offline_create"}
 ALLOWED_ENDPOINTS = {
     "/api/fs/move",
     "/api/fs/rename",
+    "/api/fs/remove",
     "/api/fs/add_offline_download",
+}
+PLAN_ENDPOINTS = {
+    "fs_move": "/api/fs/move",
+    "fs_rename": "/api/fs/rename",
+    "fs_remove": "/api/fs/remove",
+    "offline_create": "/api/fs/add_offline_download",
 }
 TASK_TYPES = {
     "move": "/api/task/move",
@@ -381,6 +388,9 @@ def render_plan(plan: Dict[str, Any]) -> None:
     final_path = plan.get("resolved", {}).get("final_path")
     if final_path:
         lines.append("  final_path: %s" % final_path)
+    entry_type = plan.get("resolved", {}).get("entry_type")
+    if entry_type:
+        lines.append("  entry_type: %s" % entry_type)
     if plan.get("resolved", {}).get("noop"):
         lines.append("  result: no-op")
     lines.append("  prechecks:")
@@ -479,6 +489,8 @@ def validate_plan_schema(plan: Dict[str, Any], config: Dict[str, Any]) -> Dict[s
     endpoint = resolved.get("endpoint")
     if endpoint not in ALLOWED_ENDPOINTS:
         raise UserFacingError("Plan endpoint is not allowed: %s." % endpoint)
+    if endpoint != PLAN_ENDPOINTS.get(plan_type):
+        raise UserFacingError("Plan endpoint does not match the plan type: %s." % endpoint)
     findings = scan_for_dangerous_signals(plan)
     if findings:
         raise UserFacingError(
@@ -503,6 +515,11 @@ def validate_plan_schema(plan: Dict[str, Any], config: Dict[str, Any]) -> Dict[s
         raise UserFacingError("Plan resolved.body must be an object.")
     if body.get("overwrite") not in {None, False}:
         raise UserFacingError("Plan overwrite must remain false.")
+    request = plan.get("request")
+    if isinstance(request, dict) and request.get("type") not in {None, plan_type}:
+        raise UserFacingError("Plan request.type does not match the plan type.")
+    if plan_type == "fs_remove":
+        validate_delete_plan(plan)
     return plan
 
 
@@ -649,6 +666,42 @@ def read_dir_listing(client: OpenListClient, path_value: str, refresh: bool = Fa
 
 def list_entry_names(result: Dict[str, Any]) -> List[str]:
     return [item.get("name") for item in extract_openlist_data_list(result.get("data")) if item.get("name")]
+
+
+def detect_entry_type(data: Any) -> str:
+    if not isinstance(data, dict):
+        return "unknown"
+    if data.get("is_dir") is True:
+        return "dir"
+    if data.get("is_dir") is False:
+        return "file"
+    return "unknown"
+
+
+def validate_delete_plan(plan: Dict[str, Any]) -> None:
+    request = plan.get("request") or {}
+    resolved = plan.get("resolved") or {}
+    body = resolved.get("body")
+    if not isinstance(body, dict):
+        raise UserFacingError("Delete plan resolved.body must be an object.")
+    dir_path = normalize_openlist_path(body.get("dir"))
+    names = body.get("names")
+    if not isinstance(names, list) or len(names) != 1:
+        raise UserFacingError("Delete plans must target exactly one path.")
+    if not isinstance(names[0], str):
+        raise UserFacingError("Delete plan entry name must be a string.")
+    entry_name = validate_new_name(names[0])
+    source_path = normalize_openlist_path(resolved.get("source_path"), allow_root=False)
+    final_path = normalize_openlist_path(resolved.get("final_path"), allow_root=False)
+    expected_path = posixpath.join(dir_path, entry_name)
+    if source_path != expected_path or final_path != source_path:
+        raise UserFacingError("Delete plan path fields do not match the resolved request.")
+    if request.get("path") != source_path:
+        raise UserFacingError("Delete plan request.path must match the resolved source path.")
+    if resolved.get("entry_type") not in {"file", "dir"}:
+        raise UserFacingError("Delete plan entry_type must remain 'file' or 'dir'.")
+    if (plan.get("risk") or {}).get("level") != "high":
+        raise UserFacingError("Delete plans must keep risk level 'high'.")
 
 
 def build_move_preview(
@@ -876,6 +929,40 @@ def build_offline_preview(
     return plan
 
 
+def build_delete_preview(
+    client: OpenListClient,
+    config: Dict[str, Any],
+    path_value: str,
+) -> Dict[str, Any]:
+    normalized_path = normalize_openlist_path(path_value, allow_root=False)
+    parent_dir, entry_name = split_dir_and_name(normalized_path)
+    request_payload = make_request_payload("fs_remove", path=normalized_path)
+    source_info = read_path_info(client, normalized_path)
+    entry_type = detect_entry_type(source_info.get("data"))
+    prechecks = [make_precheck("source_exists", source_info["ok"], source_info["message"])]
+    notes = [
+        "删除是不可逆操作；执行前必须重新获得用户明确确认。",
+        "apply 前必须向用户展示规范化后的精确路径和对象类型。",
+        "删除仅支持单个显式路径，不支持根目录或批量路径。",
+    ]
+    plan = make_plan(
+        config,
+        request_payload,
+        endpoint="/api/fs/remove",
+        body={"dir": parent_dir, "names": [entry_name]},
+        prechecks=prechecks,
+        conflicts=[],
+        notes=notes,
+        resolved_extras={
+            "source_path": normalized_path,
+            "final_path": normalized_path,
+            "entry_type": entry_type,
+        },
+    )
+    plan["risk"]["level"] = "high"
+    return plan
+
+
 def audit_preview(config: Dict[str, Any], plan: Dict[str, Any]) -> str:
     return write_audit_record(
         config,
@@ -963,6 +1050,61 @@ def execute_plan(client: OpenListClient, config: Dict[str, Any], plan: Dict[str,
             data=response.get("data"),
             hints=make_hints(response["message"], plan_type),
             rollback_hint=rollback_hint,
+        )
+    elif plan_type == "fs_remove":
+        source_path = resolved["source_path"]
+        expected_entry_type = resolved["entry_type"]
+        current_info = read_path_info(client, source_path)
+        current_entry_type = detect_entry_type(current_info.get("data"))
+        if not current_info["ok"]:
+            result = make_result(
+                False,
+                "Delete target no longer exists, so apply was denied.",
+                data={
+                    "source_path": source_path,
+                    "expected_entry_type": expected_entry_type,
+                    "actual_entry_type": "missing",
+                },
+                hints=["Run preview-delete again and confirm the updated path before retrying."],
+            )
+            result["audit_event_id"] = write_audit_record(
+                config,
+                phase="apply",
+                operation_type=plan_type,
+                inputs=validated.get("request", {}),
+                outcome=result,
+                request_id=validated["request_id"],
+                plan_id=validated["plan_id"],
+            )
+            return result
+        if current_entry_type != expected_entry_type:
+            result = make_result(
+                False,
+                "Delete target type changed since preview, so apply was denied.",
+                data={
+                    "source_path": source_path,
+                    "expected_entry_type": expected_entry_type,
+                    "actual_entry_type": current_entry_type,
+                },
+                hints=["Run preview-delete again and confirm the updated target before retrying."],
+            )
+            result["audit_event_id"] = write_audit_record(
+                config,
+                phase="apply",
+                operation_type=plan_type,
+                inputs=validated.get("request", {}),
+                outcome=result,
+                request_id=validated["request_id"],
+                plan_id=validated["plan_id"],
+            )
+            return result
+        response = client.request("POST", resolved["endpoint"], body=resolved["body"])
+        result = make_result(
+            response["ok"],
+            response["message"],
+            openlist_code=response.get("openlist_code"),
+            data=response.get("data"),
+            hints=make_hints(response["message"], plan_type),
         )
     elif plan_type == "offline_create":
         response = client.request("POST", resolved["endpoint"], body=resolved["body"])
@@ -1102,6 +1244,9 @@ def build_parser() -> argparse.ArgumentParser:
     preview_rename.add_argument("--new-name", required=True)
     preview_rename.add_argument("--conflict-policy", default=DEFAULT_CONFLICT_POLICY, choices=sorted(ALLOWED_RENAME_CONFLICT_POLICIES))
 
+    preview_delete = subparsers.add_parser("preview-delete", help="Preview a delete")
+    preview_delete.add_argument("--path", required=True)
+
     preview_offline = subparsers.add_parser("preview-offline-create", help="Preview an offline task")
     preview_offline.add_argument("--url", action="append", required=True)
     preview_offline.add_argument("--dst-dir", required=True)
@@ -1191,6 +1336,10 @@ def command_result(args: argparse.Namespace) -> Dict[str, Any]:
         return plan
     if args.command == "preview-rename":
         plan = build_rename_preview(client, config, args.path, args.new_name, args.conflict_policy)
+        plan["audit_event_id"] = audit_preview(config, plan)
+        return plan
+    if args.command == "preview-delete":
+        plan = build_delete_preview(client, config, args.path)
         plan["audit_event_id"] = audit_preview(config, plan)
         return plan
     if args.command == "preview-offline-create":

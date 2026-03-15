@@ -5,6 +5,51 @@ from pathlib import Path
 from skills.openlist.scripts import openlist
 
 
+class FakeClient(object):
+    def __init__(self, responses):
+        self.responses = {}
+        for key, value in responses.items():
+            if isinstance(value, list):
+                self.responses[key] = list(value)
+            else:
+                self.responses[key] = [value]
+        self.calls = []
+
+    def request(self, method, endpoint, *, body=None, params=None):
+        key = (method.upper(), endpoint)
+        self.calls.append({"method": method.upper(), "endpoint": endpoint, "body": body, "params": params})
+        queue = self.responses.get(key, [])
+        if not queue:
+            raise AssertionError("No fake response prepared for %s %s" % key)
+        response = queue.pop(0)
+        if callable(response):
+            response = response(method=method.upper(), endpoint=endpoint, body=body, params=params)
+        return dict(response)
+
+
+def make_remove_plan(path="/docs/report.txt", entry_type="file", *, endpoint="/api/fs/remove", risk_level="high"):
+    parent_dir, entry_name = openlist.split_dir_and_name(path)
+    return {
+        "plan_id": "p-remove",
+        "request_id": "r-remove",
+        "created_at": "2026-03-14T00:00:00+08:00",
+        "type": "fs_remove",
+        "api": {"base_url": "https://example.com/openlist"},
+        "request": {"request_id": "r-remove", "type": "fs_remove", "path": path},
+        "prechecks": [{"name": "source_exists", "ok": True, "detail": "success"}],
+        "conflicts": [],
+        "risk": {"level": risk_level, "notes": ["Delete is irreversible."]},
+        "resolved": {
+            "endpoint": endpoint,
+            "body": {"dir": parent_dir, "names": [entry_name]},
+            "source_path": path,
+            "final_path": path,
+            "entry_type": entry_type,
+            "noop": False,
+        },
+    }
+
+
 class OpenListHelpersTest(unittest.TestCase):
     def test_parse_env_text(self):
         content = """
@@ -58,6 +103,11 @@ class OpenListHelpersTest(unittest.TestCase):
     def test_task_type_mapping(self):
         self.assertEqual(openlist.TASK_TYPES["move"], "/api/task/move")
         self.assertEqual(openlist.TASK_TYPES["offline_download"], "/api/task/offline_download")
+
+    def test_delete_plan_type_and_endpoint_allowlist(self):
+        self.assertIn("fs_remove", openlist.ALLOWED_PLAN_TYPES)
+        self.assertIn("/api/fs/remove", openlist.ALLOWED_ENDPOINTS)
+        self.assertEqual(openlist.PLAN_ENDPOINTS["fs_remove"], "/api/fs/remove")
 
     def test_make_result_success(self):
         result = openlist.make_result(True, "success", openlist_code=200, data={"name": "file.txt"})
@@ -113,6 +163,19 @@ class OpenListHelpersTest(unittest.TestCase):
         with self.assertRaises(openlist.UserFacingError):
             openlist.validate_plan_schema(plan, config)
 
+    def test_validate_plan_schema_blocks_tampered_delete_plan(self):
+        config = {"base_url": "https://example.com/openlist"}
+        plan = make_remove_plan()
+        plan["resolved"]["body"]["names"] = ["report.txt", "other.txt"]
+        with self.assertRaises(openlist.UserFacingError):
+            openlist.validate_plan_schema(plan, config)
+
+    def test_validate_plan_schema_blocks_delete_endpoint_mismatch(self):
+        config = {"base_url": "https://example.com/openlist"}
+        plan = make_remove_plan(endpoint="/api/fs/rename")
+        with self.assertRaises(openlist.UserFacingError):
+            openlist.validate_plan_schema(plan, config)
+
     def test_noop_apply_writes_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {
@@ -140,6 +203,106 @@ class OpenListHelpersTest(unittest.TestCase):
             records = openlist.load_audit_records(config)
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["phase"], "apply")
+
+    def test_build_delete_preview_for_file(self):
+        client = FakeClient(
+            {
+                ("POST", "/api/fs/get"): [
+                    {"ok": True, "message": "success", "data": {"is_dir": False}},
+                ]
+            }
+        )
+        plan = openlist.build_delete_preview(client, {"base_url": "https://example.com/openlist"}, "/docs/report.txt")
+        self.assertEqual(plan["type"], "fs_remove")
+        self.assertEqual(plan["risk"]["level"], "high")
+        self.assertEqual(plan["resolved"]["body"], {"dir": "/docs", "names": ["report.txt"]})
+        self.assertEqual(plan["resolved"]["entry_type"], "file")
+        self.assertEqual(plan["resolved"]["final_path"], "/docs/report.txt")
+
+    def test_build_delete_preview_for_directory(self):
+        client = FakeClient(
+            {
+                ("POST", "/api/fs/get"): [
+                    {"ok": True, "message": "success", "data": {"is_dir": True}},
+                ]
+            }
+        )
+        plan = openlist.build_delete_preview(client, {"base_url": "https://example.com/openlist"}, "/docs/archive")
+        self.assertEqual(plan["resolved"]["body"], {"dir": "/docs", "names": ["archive"]})
+        self.assertEqual(plan["resolved"]["entry_type"], "dir")
+
+    def test_build_delete_preview_rejects_invalid_paths(self):
+        client = FakeClient({})
+        for invalid in ("/", "", "docs/report.txt", "/docs/../report.txt"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(openlist.UserFacingError):
+                    openlist.build_delete_preview(client, {"base_url": "https://example.com/openlist"}, invalid)
+
+    def test_execute_plan_delete_success_writes_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "base_url": "https://example.com/openlist",
+                "audit_path": Path(tmp) / "audit.jsonl",
+            }
+            client = FakeClient(
+                {
+                    ("POST", "/api/fs/get"): [
+                        {"ok": True, "message": "success", "data": {"is_dir": False}},
+                    ],
+                    ("POST", "/api/fs/remove"): [
+                        {"ok": True, "message": "Removed", "openlist_code": 200, "data": {}},
+                    ],
+                }
+            )
+            result = openlist.execute_plan(client=client, config=config, plan=make_remove_plan())
+            self.assertTrue(result["ok"])
+            self.assertEqual(client.calls[1]["endpoint"], "/api/fs/remove")
+            records = openlist.load_audit_records(config)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["phase"], "apply")
+
+    def test_execute_plan_delete_denies_when_target_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "base_url": "https://example.com/openlist",
+                "audit_path": Path(tmp) / "audit.jsonl",
+            }
+            client = FakeClient(
+                {
+                    ("POST", "/api/fs/get"): [
+                        {"ok": True, "message": "success", "data": {"is_dir": True}},
+                    ]
+                }
+            )
+            result = openlist.execute_plan(client=client, config=config, plan=make_remove_plan(entry_type="file"))
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["data"]["actual_entry_type"], "dir")
+            records = openlist.load_audit_records(config)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["phase"], "apply")
+
+    def test_execute_plan_delete_surfaces_openlist_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "base_url": "https://example.com/openlist",
+                "audit_path": Path(tmp) / "audit.jsonl",
+            }
+            client = FakeClient(
+                {
+                    ("POST", "/api/fs/get"): [
+                        {"ok": True, "message": "success", "data": {"is_dir": False}},
+                    ],
+                    ("POST", "/api/fs/remove"): [
+                        {"ok": False, "message": "Permission denied", "openlist_code": 403, "data": {}},
+                    ],
+                }
+            )
+            result = openlist.execute_plan(client=client, config=config, plan=make_remove_plan())
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["openlist_code"], 403)
+            records = openlist.load_audit_records(config)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["outcome"]["message"], "Permission denied")
 
     def test_audit_show_filter_by_tid(self):
         with tempfile.TemporaryDirectory() as tmp:
